@@ -1,0 +1,4 @@
+(library
+ (name safe_m4)
+ (public_name safe_m4)
+ (libraries str))

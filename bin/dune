@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name safe_m4)
+ (libraries safe_m4))
