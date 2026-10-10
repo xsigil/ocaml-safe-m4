@@ -74,11 +74,11 @@ let rec expand t input =
         if not (has_macro_or_builtin t name) then
           write_output t name
         else begin
-          match collect_args t with
+          match collect_args t name with
           | Error e ->
               result_err := Some e;
               continue_loop := false
-          | Ok args ->
+          | Ok (args, _has_paren) ->
               incr depth;
               if !depth > t.max_depth then begin
                 result_err := Some "maximum macro recursion depth exceeded";
@@ -108,15 +108,14 @@ let rec expand t input =
       in
       Ok out0
 
-and collect_args t =
+and collect_args t macro_name =
   match Lexer.read_char t.lex with
-  | None -> Ok []
+  | None -> Ok ([], false)
   | Some '(' ->
       let (lq, rq) = Lexer.get_quotes t.lex in
       let args = ref [] in
       let current = Buffer.create 16 in
       let paren_depth = ref 0 in
-      let quote_depth = ref 0 in
       let finished = ref false in
       let err_res = ref None in
 
@@ -134,56 +133,52 @@ and collect_args t =
           let sub_engine = create ~sandbox_root:t.sandbox_root () in
           Hashtbl.iter (Hashtbl.replace sub_engine.macros) t.macros;
           Hashtbl.iter (Hashtbl.replace sub_engine.builtins) t.builtins;
+          Lexer.set_quotes sub_engine.lex lq rq;
           expand sub_engine s
       in
 
       while not !finished do
         if Lexer.match_prefix t.lex lq then begin
-          incr quote_depth;
-          Buffer.add_string current lq
-        end else if !quote_depth > 0 && Lexer.match_prefix t.lex rq then begin
-          decr quote_depth;
-          Buffer.add_string current rq
+          let inner = Lexer.read_until_matching t.lex lq rq in
+          Buffer.add_string current (lq ^ inner ^ rq)
         end else
           match Lexer.read_char t.lex with
           | None ->
-              err_res := Some "unexpected EOF reading macro arguments";
+              err_res := Some (Printf.sprintf "unexpected EOF reading macro arguments for %S" macro_name);
               finished := true
+          | Some '(' ->
+              incr paren_depth;
+              Buffer.add_char current '('
+          | Some ')' ->
+              if !paren_depth = 0 then begin
+                (match process_arg (Buffer.contents current) with
+                 | Ok arg_str ->
+                     if not (!args = [] && Buffer.length current = 0) then
+                       args := arg_str :: !args
+                 | Error e -> err_res := Some e);
+                finished := true
+              end else begin
+                decr paren_depth;
+                Buffer.add_char current ')'
+              end
+          | Some ',' ->
+              if !paren_depth = 0 then begin
+                (match process_arg (Buffer.contents current) with
+                 | Ok arg_str -> args := arg_str :: !args
+                 | Error e -> err_res := Some e);
+                Buffer.clear current
+              end else
+                Buffer.add_char current ','
           | Some c ->
-              if !quote_depth > 0 then Buffer.add_char current c
-              else match c with
-              | '(' ->
-                  incr paren_depth;
-                  Buffer.add_char current '('
-              | ')' ->
-                  if !paren_depth = 0 then begin
-                    (match process_arg (Buffer.contents current) with
-                     | Ok arg_str ->
-                         if not (!args = [] && Buffer.length current = 0) then
-                           args := arg_str :: !args
-                     | Error e -> err_res := Some e);
-                    finished := true
-                  end else begin
-                    decr paren_depth;
-                    Buffer.add_char current ')'
-                  end
-              | ',' ->
-                  if !paren_depth = 0 then begin
-                    (match process_arg (Buffer.contents current) with
-                     | Ok arg_str -> args := arg_str :: !args
-                     | Error e -> err_res := Some e);
-                    Buffer.clear current
-                  end else
-                    Buffer.add_char current ','
-              | _ -> Buffer.add_char current c
+              Buffer.add_char current c
       done;
 
       (match !err_res with
        | Some e -> Error e
-       | None -> Ok (List.rev !args))
+       | None -> Ok (List.rev !args, true))
   | Some other ->
       Lexer.unread_char t.lex other;
-      Ok []
+      Ok ([], false)
 
 and eval_macro t name args =
   match name with

@@ -21,8 +21,8 @@ let assert_equal name got want =
   end
 
 let () =
-  let run name input expected =
-    let eng = Engine.create () in
+  let run ?sandbox name input expected =
+    let eng = match sandbox with Some s -> Engine.create ~sandbox_root:s () | None -> Engine.create () in
     match Engine.expand eng input with
     | Ok got -> assert_equal name got expected
     | Error err ->
@@ -30,29 +30,54 @@ let () =
         exit 1
   in
 
-  print_endline "=== Running OCaml Safe-M4 Test Suite ===";
+  let run_fail ?sandbox name input expect_err_sub =
+    let eng = match sandbox with Some s -> Engine.create ~sandbox_root:s () | None -> Engine.create () in
+    match Engine.expand eng input with
+    | Ok got ->
+        Printf.printf "\n=== EXPECTED ERROR BUT GOT SUCCESS: %s ===\nGOT : %S\n" name got;
+        exit 1
+    | Error err ->
+        if (try ignore (Str.search_forward (Str.regexp_string expect_err_sub) err 0); true with Not_found -> false) then
+          Printf.printf "PASS (Expected Error): %s\n" name
+        else begin
+          Printf.printf "\n=== UNEXPECTED ERROR: %s ===\nGOT ERROR: %S\nWANT SUBSTRING: %S\n" name err expect_err_sub;
+          exit 1
+        end
+  in
+
+  print_endline "=== Running OCaml Safe-M4 Full POSIX Test Suite ===";
   run "simple define" "define(`FOO', `bar')FOO" "bar";
   run "macro with args" "define(`GREET', `Hello, $1!')GREET(`World')" "Hello, World!";
   run "ifelse match" "ifelse(`a', `a', `YES', `NO')" "YES";
   run "ifelse mismatch" "ifelse(`a', `b', `YES', `NO')" "NO";
   
-  (* Goで苦戦した: 先行展開 (eager evaluation) の検証 *)
+  (* Eager Evaluation *)
   run "eval arithmetic" "eval(`(10 + 20) * 2 - 5')" "55";
   run "eval with ifelse" "ifelse(eval(`10 > 5'), 1, `YES', `NO')" "YES";
-  
-  (* Goで苦戦した: コメント透過と changecom *)
+  run "eval bitwise & logic" "eval(`(1 << 3) | 2 & ~0')" "10";
+  run "eval logic short" "eval(`10 > 5 && 2 < 4')" "1";
+
+  (* Comments & Changecom *)
   run "comments pass through" "define(`FOO', `bar')# FOO is not expanded\nFOO" "# FOO is not expanded\nbar";
   run "changecom custom" "define(`FOO', `bar')changecom(`/*', `*/')/* FOO */ FOO" "/* FOO */ bar";
 
-  (* 範囲置換 *)
-  run "translit range" "translit(`hello 123', `a-z', `A-Z')" "HELLO 123";
+  (* Diversion & Undivert *)
+  run "diversions test" "divert(1)diverted text\ndivert(0)initial text\nundivert(1)" "initial text\ndiverted text\n";
 
-  (* Raw 出力ルーティング *)
+  (* Translit, Substr, Index *)
+  run "translit range" "translit(`hello 123', `a-z', `A-Z')" "HELLO 123";
+  run "substr test" "substr(`gnus and gnats', `9', `5')" "gnats";
+  run "index test" "index(`gnus and gnats', `gnat')" "9";
+
+  (* Raw Escaping *)
   run "html escape" "h(`<script>alert(1)</script>')" "&lt;script&gt;alert(1)&lt;/script&gt;";
   run "shell quote" "sh_quote(`echo \"test\"')" "'echo \"test\"'";
 
-  (* クォート保持 *)
+  (* Nested Quotes *)
   run "nested quotes" "define(`WRAP', `[$1]')WRAP(```inner quote''')" "[`inner quote']";
   run "dnl newline" "define(`FOO', `bar')dnl\nFOO" "bar";
+
+  (* Sandbox Security *)
+  run_fail ~sandbox:"/tmp" "traversal blocked" "include(`../../etc/passwd')" "security violation";
 
   print_endline "=== All OCaml tests passed! ==="

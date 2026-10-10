@@ -133,85 +133,247 @@ let builtin_decr _ctx = function
        with _ -> Error (Printf.sprintf "decr: non-numeric argument %S" n_str))
   | [] -> Error "decr: missing argument"
 
-let eval_simple expr_str =
+let builtin_divert ctx args =
+  let div =
+    match args with
+    | s :: _ when s <> "" -> (try int_of_string (String.trim s) with _ -> 0)
+    | _ -> 0
+  in
+  ctx.set_current_div div;
+  Ok ""
+
+let builtin_undivert ctx args =
+  let targets =
+    match args with
+    | [] ->
+        let keys = ctx.get_all_diversion_keys () in
+        List.sort compare (List.filter (fun k -> k > 0) keys)
+    | _ ->
+        List.filter_map (fun s ->
+          try
+            let k = int_of_string (String.trim s) in
+            if k > 0 then Some k else None
+          with _ -> None
+        ) args
+  in
+  let buf = Buffer.create 128 in
+  List.iter (fun d ->
+    let div_buf = ctx.get_diversion d in
+    Buffer.add_buffer buf div_buf;
+    ctx.remove_diversion d
+  ) targets;
+  Ok (Buffer.contents buf)
+
+let check_sandbox root path =
+  if Filename.is_relative path then
+    let full = Filename.concat root path in
+    (* 簡易パストラバーサル検出 *)
+    let segs = String.split_on_char '/' path in
+    let depth = ref 0 in
+    let violated = ref false in
+    List.iter (fun seg ->
+      if seg = ".." then begin
+        decr depth;
+        if !depth < 0 then violated := true
+      end else if seg <> "." && seg <> "" then
+        incr depth
+    ) segs;
+    if !violated then Error (Printf.sprintf "security violation: path traversal detected in include(%s)" path)
+    else Ok full
+  else
+    Error (Printf.sprintf "security violation: absolute paths not allowed in include(%s)" path)
+
+let builtin_include_common is_silent ctx args =
+  match args with
+  | [] | [""] ->
+      if is_silent then Ok "" else Error "include: missing file path"
+  | path :: _ ->
+      match check_sandbox (ctx.get_sandbox_root ()) (String.trim path) with
+      | Error err -> if is_silent then Ok "" else Error err
+      | Ok full_path ->
+          try
+            let ch = open_in full_path in
+            let len = in_channel_length ch in
+            let s = really_input_string ch len in
+            close_in ch;
+            Ok s
+          with _ ->
+            if is_silent then Ok ""
+            else Error (Printf.sprintf "include(%s): file not found or inaccessible" path)
+
+let builtin_include ctx args = builtin_include_common false ctx args
+let builtin_sinclude ctx args = builtin_include_common true ctx args
+
+(* POSIX eval 実装: ビット演算、論理演算、比較、四則演算 *)
+let eval_ast expr_str =
   let s = String.trim expr_str in
   try
-    let lexbuf = Lexing.from_string s in
-    let tokens = ref [] in
-    let rec tokenize () =
-      if lexbuf.Lexing.lex_curr_pos >= String.length s then ()
-      else
-        let c = s.[lexbuf.Lexing.lex_curr_pos] in
-        lexbuf.Lexing.lex_curr_pos <- lexbuf.Lexing.lex_curr_pos + 1;
-        if c = ' ' || c = '\t' || c = '\n' then tokenize ()
-        else if c >= '0' && c <= '9' then begin
-          let start = lexbuf.Lexing.lex_curr_pos - 1 in
-          while lexbuf.Lexing.lex_curr_pos < String.length s &&
-                s.[lexbuf.Lexing.lex_curr_pos] >= '0' && s.[lexbuf.Lexing.lex_curr_pos] <= '9' do
-            lexbuf.Lexing.lex_curr_pos <- lexbuf.Lexing.lex_curr_pos + 1
-          done;
-          let num_str = String.sub s start (lexbuf.Lexing.lex_curr_pos - start) in
-          tokens := `INT (int_of_string num_str) :: !tokens;
-          tokenize ()
-        end else begin
-          let tok = match c with
-            | '+' -> `ADD | '-' -> `SUB | '*' -> `MUL | '/' -> `DIV | '%' -> `MOD
-            | '(' -> `LPAREN | ')' -> `RPAREN
-            | '>' -> `GT | '<' -> `LT | '=' -> `EQ | '!' -> `NOT
-            | _ -> failwith "invalid char"
-          in
-          tokens := tok :: !tokens;
-          tokenize ()
-        end
+    let len = String.length s in
+    let pos = ref 0 in
+    let peek_char () = if !pos < len then Some s.[!pos] else None in
+    let get_char () =
+      if !pos < len then let c = s.[!pos] in incr pos; Some c else None
     in
-    tokenize ();
-    let tok_list = ref (List.rev !tokens) in
-    let peek () = match !tok_list with [] -> `EOF | hd :: _ -> hd in
-    let consume () = match !tok_list with [] -> () | _ :: tl -> tok_list := tl in
+    let rec skip_ws () =
+      match peek_char () with
+      | Some (' ' | '\t' | '\n' | '\r') -> incr pos; skip_ws ()
+      | _ -> ()
+    in
 
-    let rec parse_factor () =
-      match peek () with
-      | `INT n -> consume (); n
-      | `SUB -> consume (); -(parse_factor ())
-      | `LPAREN ->
-          consume ();
-          let v = parse_expr () in
-          if peek () = `RPAREN then consume () else failwith "mismatched paren";
-          v
-      | _ -> failwith "syntax error in factor"
-    and parse_term () =
+    let rec parse_primary () =
+      skip_ws ();
+      match peek_char () with
+      | Some '(' ->
+          incr pos;
+          let v = parse_logical_or () in
+          skip_ws ();
+          (match get_char () with
+           | Some ')' -> v
+           | _ -> failwith "mismatched parenthesis")
+      | Some '-' ->
+          incr pos;
+          -(parse_primary ())
+      | Some '+' ->
+          incr pos;
+          parse_primary ()
+      | Some '~' ->
+          incr pos;
+          lnot (parse_primary ())
+      | Some '!' ->
+          incr pos;
+          if parse_primary () = 0 then 1 else 0
+      | Some ('0'..'9') ->
+          let start_p = !pos in
+          while match peek_char () with Some ('0'..'9') -> true | _ -> false do
+            incr pos
+          done;
+          int_of_string (String.sub s start_p (!pos - start_p))
+      | _ -> failwith "syntax error in number"
+
+    and parse_multiplicative () =
       let rec loop acc =
-        match peek () with
-        | `MUL -> consume (); loop (acc * parse_factor ())
-        | `DIV -> consume (); let r = parse_factor () in loop (acc / r)
-        | `MOD -> consume (); let r = parse_factor () in loop (acc mod r)
+        skip_ws ();
+        match peek_char () with
+        | Some '*' -> incr pos; loop (acc * parse_primary ())
+        | Some '/' ->
+            incr pos;
+            let rhs = parse_primary () in
+            if rhs = 0 then failwith "division by zero" else loop (acc / rhs)
+        | Some '%' ->
+            incr pos;
+            let rhs = parse_primary () in
+            if rhs = 0 then failwith "division by zero" else loop (acc mod rhs)
         | _ -> acc
       in
-      loop (parse_factor ())
-    and parse_add () =
+      loop (parse_primary ())
+
+    and parse_additive () =
       let rec loop acc =
-        match peek () with
-        | `ADD -> consume (); loop (acc + parse_term ())
-        | `SUB -> consume (); loop (acc - parse_term ())
+        skip_ws ();
+        match peek_char () with
+        | Some '+' -> incr pos; loop (acc + parse_multiplicative ())
+        | Some '-' -> incr pos; loop (acc - parse_multiplicative ())
         | _ -> acc
       in
-      loop (parse_term ())
-    and parse_expr () =
-      let lhs = parse_add () in
-      match peek () with
-      | `GT -> consume (); if lhs > parse_add () then 1 else 0
-      | `LT -> consume (); if lhs < parse_add () then 1 else 0
-      | `EQ -> consume (); if peek () = `EQ then consume (); if lhs = parse_add () then 1 else 0
+      loop (parse_multiplicative ())
+
+    and parse_shift () =
+      let rec loop acc =
+        skip_ws ();
+        if !pos + 1 < len && s.[!pos] = '<' && s.[!pos+1] = '<' then begin
+          pos := !pos + 2;
+          loop (acc lsl parse_additive ())
+        end else if !pos + 1 < len && s.[!pos] = '>' && s.[!pos+1] = '>' then begin
+          pos := !pos + 2;
+          loop (acc lsr parse_additive ())
+        end else acc
+      in
+      loop (parse_additive ())
+
+    and parse_relational () =
+      let lhs = parse_shift () in
+      skip_ws ();
+      if !pos + 1 < len && s.[!pos] = '<' && s.[!pos+1] = '=' then begin
+        pos := !pos + 2; if lhs <= parse_shift () then 1 else 0
+      end else if !pos + 1 < len && s.[!pos] = '>' && s.[!pos+1] = '=' then begin
+        pos := !pos + 2; if lhs >= parse_shift () then 1 else 0
+      end else match peek_char () with
+      | Some '<' -> incr pos; if lhs < parse_shift () then 1 else 0
+      | Some '>' -> incr pos; if lhs > parse_shift () then 1 else 0
       | _ -> lhs
+
+    and parse_equality () =
+      let lhs = parse_relational () in
+      skip_ws ();
+      if !pos + 1 < len && s.[!pos] = '=' && s.[!pos+1] = '=' then begin
+        pos := !pos + 2; if lhs = parse_relational () then 1 else 0
+      end else if !pos + 1 < len && s.[!pos] = '!' && s.[!pos+1] = '=' then begin
+        pos := !pos + 2; if lhs <> parse_relational () then 1 else 0
+      end else lhs
+
+    and parse_bitwise_and () =
+      let rec loop acc =
+        skip_ws ();
+        if !pos < len && s.[!pos] = '&' && (!pos + 1 >= len || s.[!pos+1] <> '&') then begin
+          incr pos;
+          loop (acc land parse_equality ())
+        end else acc
+      in
+      loop (parse_equality ())
+
+    and parse_bitwise_xor () =
+      let rec loop acc =
+        skip_ws ();
+        match peek_char () with
+        | Some '^' -> incr pos; loop (acc lxor parse_bitwise_and ())
+        | _ -> acc
+      in
+      loop (parse_bitwise_and ())
+
+    and parse_bitwise_or () =
+      let rec loop acc =
+        skip_ws ();
+        if !pos < len && s.[!pos] = '|' && (!pos + 1 >= len || s.[!pos+1] <> '|') then begin
+          incr pos;
+          loop (acc lor parse_bitwise_xor ())
+        end else acc
+      in
+      loop (parse_bitwise_xor ())
+
+    and parse_logical_and () =
+      let rec loop acc =
+        skip_ws ();
+        if !pos + 1 < len && s.[!pos] = '&' && s.[!pos+1] = '&' then begin
+          pos := !pos + 2;
+          let rhs = parse_bitwise_or () in
+          loop (if acc <> 0 && rhs <> 0 then 1 else 0)
+        end else acc
+      in
+      loop (parse_bitwise_or ())
+
+    and parse_logical_or () =
+      let rec loop acc =
+        skip_ws ();
+        if !pos + 1 < len && s.[!pos] = '|' && s.[!pos+1] = '|' then begin
+          pos := !pos + 2;
+          let rhs = parse_logical_and () in
+          loop (if acc <> 0 || rhs <> 0 then 1 else 0)
+        end else acc
+      in
+      loop (parse_logical_and ())
     in
-    Ok (parse_expr ())
+
+    let res = parse_logical_or () in
+    skip_ws ();
+    if !pos < len then failwith "unexpected tokens at end of expression"
+    else Ok res
   with e -> Error (Printexc.to_string e)
 
 let builtin_eval _ctx args =
   match args with
   | [] -> Ok "0"
   | expr :: rest ->
-      match eval_simple expr with
+      match eval_ast expr with
       | Ok v ->
           let radix =
             match rest with
@@ -219,13 +381,18 @@ let builtin_eval _ctx args =
             | _ -> 10
           in
           if radix = 16 then Ok (Printf.sprintf "%x" v)
+          else if radix = 8 then Ok (Printf.sprintf "%o" v)
+          else if radix = 2 then
+            let rec to_bin n =
+              if n = 0 then "" else (to_bin (n lsr 1)) ^ (string_of_int (n land 1))
+            in
+            if v = 0 then Ok "0" else Ok (to_bin v)
           else Ok (string_of_int v)
       | Error err -> Error ("eval: " ^ err)
 
 let dummy_control _ctx _args = Ok ""
 
 let register_defaults reg =
-  (* 制御マクロもビルトインとして登録 *)
   reg "define" dummy_control;
   reg "undefine" dummy_control;
   reg "ifdef" dummy_control;
@@ -236,7 +403,11 @@ let register_defaults reg =
   reg "shift" dummy_control;
   reg "defn" dummy_control;
 
-  (* 標準 POSIX ビルトイン *)
+  reg "divert" builtin_divert;
+  reg "undivert" builtin_undivert;
+  reg "include" builtin_include;
+  reg "sinclude" builtin_sinclude;
+
   reg "len" builtin_len;
   reg "index" builtin_index;
   reg "substr" builtin_substr;
@@ -245,7 +416,6 @@ let register_defaults reg =
   reg "decr" builtin_decr;
   reg "eval" builtin_eval;
 
-  (* エスケープ関数 *)
   reg "h" (fun _ args -> Ok (match args with s :: _ -> html_escape s | [] -> ""));
   reg "html_escape" (fun _ args -> Ok (match args with s :: _ -> html_escape s | [] -> ""));
   reg "json_escape" (fun _ args -> Ok (match args with s :: _ -> json_escape s | [] -> ""));

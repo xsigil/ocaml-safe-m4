@@ -31,9 +31,10 @@ let rec read_char t =
       t.stack <- rest;
       read_char t
   | top :: rest ->
+      let len = String.length top in
       let c = top.[0] in
-      let sub = String.sub top 1 (String.length top - 1) in
-      t.stack <- sub :: rest;
+      if len = 1 then t.stack <- rest
+      else t.stack <- String.sub top 1 (len - 1) :: rest;
       Some c
 
 let unread_char t c =
@@ -55,7 +56,7 @@ let match_prefix t prefix =
     done;
     if !matched then true
     else begin
-      List.iter (unread_char t) !read_chars;
+      List.iter (unread_char t) (List.rev !read_chars);
       false
     end
 
@@ -64,7 +65,7 @@ let read_until_matching t open_delim close_delim =
   let depth = ref 1 in
   let continue_reading = ref true in
   while !continue_reading do
-    if match_prefix t open_delim then begin
+    if open_delim <> close_delim && match_prefix t open_delim then begin
       incr depth;
       Buffer.add_string buf open_delim
     end else if match_prefix t close_delim then begin
